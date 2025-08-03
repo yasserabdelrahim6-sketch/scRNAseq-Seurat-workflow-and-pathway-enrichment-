@@ -1,0 +1,313 @@
+
+---
+title: "Single-cell RNA-seq Analysis Workflow"
+author: Yasser Abdelrahim 
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+# Introduction
+
+This notebook performs a full single-cell RNA-seq workflow using Seurat and related packages:
+
+- Data loading & merging
+- Cell/gene QC and filtering
+- Normalization, PCA, UMAP, clustering
+- Differential expression and enrichment
+- Clear, reproducible code structure for sharing or public release
+
+---
+
+# Setup
+
+```{r setup, echo=TRUE, message=FALSE, warning=FALSE}
+# Set working directory to this file's location (only works in RStudio)
+if (interactive() && requireNamespace("rstudioapi", quietly = TRUE)) {
+  setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+}
+dir.create("write/figures", showWarnings=FALSE, recursive=TRUE)
+dir.create("write/tables", showWarnings=FALSE, recursive=TRUE)
+options(stringsAsFactors = FALSE)
+```
+
+# Packages
+
+```{r packages, message=FALSE, warning=FALSE}
+required_pkgs <- c(
+  "tidyverse","Seurat","SCpubr","scater","org.Mm.eg.db","clusterProfiler",
+  "SeuratDisk","enrichplot","msigdbr","EnhancedVolcano","purrr","clustree"
+)
+suppressMessages(lapply(required_pkgs, require, character.only=TRUE))
+suppressMessages(library(clusterProfiler))
+```
+
+# Data Input
+
+**Update the paths below to match your dataset folder structure.**
+
+```{r data-import}
+data_paths <- list(
+  wt1  = "data/WTAC_SCRNA8012500/filtered_feature_bc_matrix",
+  scr1 = "data/WTAC_SCRNA8012504/filtered_feature_bc_matrix",
+  scr2 = "data/WTAC_SCRNA8012505/filtered_feature_bc_matrix"
+)
+stopifnot(all(file.exists(file.path(data_paths$wt1, "matrix.mtx.gz")),
+              file.exists(file.path(data_paths$scr1, "matrix.mtx.gz")),
+              file.exists(file.path(data_paths$scr2, "matrix.mtx.gz"))))
+
+wt1  <- Read10X(data.dir = data_paths$wt1)
+scr1 <- Read10X(data.dir = data_paths$scr1)
+scr2 <- Read10X(data.dir = data_paths$scr2)
+```
+
+# Merge Samples & Create Seurat Object
+
+```{r merge-seurat}
+add_suffix <- function(mat, suffix) {
+  colnames(mat) <- paste(colnames(mat), suffix, sep="_")
+  mat
+}
+wt1_mtx  <- add_suffix(wt1, "wt1")
+scr1_mtx <- add_suffix(scr1, "scr1")
+scr2_mtx <- add_suffix(scr2, "scr2")
+exprs_mtx <- cbind(wt1_mtx, scr1_mtx, scr2_mtx)
+
+seu <- CreateSeuratObject(counts = exprs_mtx, project = "scRNA")
+seu$batch     <- stringr::str_split(colnames(seu), "_", simplify=TRUE)[,2]
+seu$condition <- ifelse(seu$batch == "wt1", "WT", "SCRAMBLED")
+seu[["percent_mt"]] <- PercentageFeatureSet(seu, pattern = "^mt-")
+```
+
+# Quality Control (QC)
+
+## QC Plots (Library Size, Features, Mitochondrial %)
+
+```{r qc-plots, fig.width=10, fig.height=6, warning=FALSE}
+# Library size
+VlnPlot(seu, features = "nCount_RNA", group.by = "condition") +
+  labs(title = "Library Size")
+ggsave("write/figures/violin_library_size.png", height=6, width=8)
+outlier_counts <- isOutlier(seu$nCount_RNA, nmads=3, log=TRUE)
+outlier_thresholds <- attr(outlier_counts, "thresholds")
+seu@meta.data %>%
+  ggplot(aes(x = nCount_RNA, fill = condition)) +
+  geom_histogram(bins=50) +
+  facet_grid(condition~.) +
+  geom_vline(xintercept = outlier_thresholds, color="red") +
+  labs(x = "Library Size", y = "Frequency")
+ggsave("write/figures/hist_library_size.png", height=6, width=8)
+
+# Features
+VlnPlot(seu, features = "nFeature_RNA", group.by = "condition") +
+  labs(title = "Total Features")
+ggsave("write/figures/violin_total_features.png", height=6, width=8)
+features_outlier <- isOutlier(seu$nFeature_RNA, nmads=3, log=TRUE)
+features_thresholds <- attr(features_outlier, "thresholds")
+seu@meta.data %>%
+  ggplot(aes(x = nFeature_RNA, fill = condition)) +
+  geom_histogram(bins=50) +
+  facet_grid(condition~.) +
+  geom_vline(xintercept = features_thresholds, color="red") +
+  labs(x = "Number of Features", y = "Frequency")
+ggsave("write/figures/hist_total_features.png", height=6, width=8)
+
+# Mitochondrial percentage
+VlnPlot(seu, features = "percent_mt", group.by = "condition") +
+  labs(title = "Percent Mitochondrial Genes")
+ggsave("write/figures/violin_percent_mt.png", height=6, width=8)
+seu@meta.data %>%
+  ggplot(aes(x = percent_mt, fill = condition)) +
+  geom_histogram(bins=30) +
+  facet_grid(condition~.) +
+  geom_vline(xintercept = 15, color="red") +
+  labs(x = "Percent Mitochondrial Genes", y = "Frequency")
+ggsave("write/figures/hist_percent_mt.png", height=6, width=8)
+
+# Combined scatter QC
+seu@meta.data %>%
+  ggplot(aes(x = nCount_RNA, y = nFeature_RNA, color = percent_mt)) + 
+  geom_point(alpha=0.5) + facet_grid(condition~.) +
+  scale_color_viridis_c() + 
+  geom_vline(xintercept = outlier_thresholds, color="red") +
+  geom_hline(yintercept = features_thresholds, color="red") +
+  labs(x = "Library Size", y = "Detected Features", color = "% mt")
+ggsave("write/figures/combined_qc_scatter.png", height=6, width=8)
+```
+
+# Filter Cells and Genes
+
+```{r filter-cells-genes}
+# Filter cells by QC
+seu <- subset(
+  seu, 
+  subset = (nCount_RNA > outlier_thresholds[1]) & 
+           (nCount_RNA < outlier_thresholds[2]) & 
+           (nFeature_RNA > features_thresholds[1]) & 
+           (nFeature_RNA < features_thresholds[2]) & 
+           (percent_mt < 15)
+)
+
+# Filter genes expressed in >= 3 cells
+filter_genes <- function(seurat, min_cells=3) {
+  counts <- as.matrix(seurat@assays$RNA@layers$counts)
+  detected <- rowSums(counts > 0)
+  genes_use <- names(detected[detected > min_cells])
+  subset(seurat, features = genes_use)
+}
+
+seu <- filter_genes(seu, min_cells=3)
+```
+
+# Normalization, Variable Genes, and Scaling
+
+```{r normalization}
+seu <- NormalizeData(seu)
+seu <- FindVariableFeatures(seu)
+seu <- ScaleData(seu, features = rownames(seu))
+```
+
+# Cell Cycle Scoring
+
+```{r cellcycle}
+cc_genes_mouse <- readRDS("data/cc.genes.mouse.rds") 
+seu <- CellCycleScoring(
+  seu, s.features = cc_genes_mouse$s.genes, 
+  g2m.features = cc_genes_mouse$g2m.genes, 
+  set.ident = TRUE
+)
+table(seu$Phase)
+```
+
+# SCTransform and PCA
+
+```{r sct-pca}
+seu <- SCTransform(seu, variable.features.n = 3000)
+seu <- RunPCA(seu)
+ElbowPlot(seu, ndims = 40)
+```
+
+# PCA Plots
+
+```{r pca-plots, fig.width=8, fig.height=6}
+DimPlot(seu, reduction="pca", group.by="Phase") + ggtitle("PCA: Cell Cycle Phase") 
+ggsave("write/figures/pca_phase.png", height=6, width=8)
+DimPlot(seu, reduction="pca", group.by="batch") + ggtitle("PCA: Batch")
+ggsave("write/figures/pca_batch.png", height=6, width=8)
+DimPlot(seu, reduction="pca", group.by="condition") + ggtitle("PCA: Condition")
+ggsave("write/figures/pca_condition.png", height=6, width=8)
+```
+
+# Cell Cycle Regression
+
+```{r regress-cellcycle}
+seu <- SCTransform(seu, variable.features.n = 3000, vars.to.regress="Phase")
+seu <- RunPCA(seu)
+```
+
+# UMAP and Clustering
+
+```{r umap-cluster}
+seu <- RunUMAP(seu, dims = 1:20)
+seu <- FindNeighbors(seu, dims = 1:20)
+
+for(i in seq(0,1,0.1)){
+  seu_subset <- seu %>%
+    FindNeighbors(
+      reduction = "pca",
+      dims = 1:20
+    ) %>%
+    FindClusters(resolution = i)
+}
+
+seu <- FindClusters(seu, resolution = 0.2)
+```
+
+# UMAP Visualization
+
+```{r umap-plots, fig.width=8, fig.height=6}
+DimPlot(seu, reduction="umap", group.by="seurat_clusters", label=TRUE) + ggtitle("UMAP: Seurat Clusters")
+ggsave("write/figures/umap_clusters.png", height=6, width=8)
+DimPlot(seu, reduction="umap", group.by="condition") + ggtitle("UMAP: Condition")
+ggsave("write/figures/umap_condition.png", height=6, width=8)
+DimPlot(seu, reduction="umap", group.by="Phase") + ggtitle("UMAP: Cell Cycle Phase")
+ggsave("write/figures/umap_phase.png", height=6, width=8)
+```
+
+# Differential Expression
+
+```{r diffex}
+markers_scr_vs_wt <- FindMarkers(
+  seu, group.by="condition", ident.1="SCRAMBLED", ident.2="WT",
+  min.pct=0, logfc.threshold=0, return.thresh=1
+)
+write.csv(markers_scr_vs_wt, "write/tables/markers_scr_vs_wt.csv")
+all_markers <- FindAllMarkers(seu, return.thresh=1, min.pct=0, logfc.threshold=0)
+write.csv(all_markers, "write/tables/all_markers.csv")
+```
+
+# Volcano Plot & Heatmap
+
+```{r volcano-heatmap, fig.width=8, fig.height=6}
+EnhancedVolcano(
+  markers_scr_vs_wt,
+  lab = rownames(markers_scr_vs_wt),
+  x = "avg_log2FC",
+  y = "p_val_adj",
+  title = "WT vs SCRAMBLED",
+  pCutoff = 0.05,
+  FCcutoff = 0.5,
+  labSize = 3
+)
+ggsave("write/figures/volcano.png", height=6, width=8)
+
+top10 <- all_markers %>%
+  group_by(cluster) %>%
+  slice_max(avg_log2FC, n = 10)
+DoHeatmap(seu, features = top10$gene, group.by="seurat_clusters", label=TRUE)
+ggsave("write/figures/heatmap_top10.png", height=8, width=10)
+```
+
+# Enrichment Analysis (GO, ORA, GSEA)
+
+```{r enrichment}
+sig_up <- markers_scr_vs_wt %>%
+  rownames_to_column("gene") %>%
+  filter(p_val_adj < 0.05, avg_log2FC > 0.5) %>%
+  pull(gene)
+
+# GO
+go_bp <- enrichGO(gene=sig_up, OrgDb=org.Mm.eg.db, keyType="SYMBOL", ont="BP", readable=TRUE)
+write.csv(as.data.frame(go_bp), "write/tables/GO_BP.csv", row.names=FALSE)
+
+# ORA with Hallmark
+hallmark <- msigdbr(species = "Mus musculus", category = "H") %>%
+  dplyr::select(gs_name, gene_symbol)
+hallmark_ora <- enricher(gene=sig_up, TERM2GENE=hallmark, pvalueCutoff=0.05)
+write.csv(as.data.frame(hallmark_ora), "write/tables/ORA_Hallmark.csv", row.names=FALSE)
+
+# GSEA
+ranked <- markers_scr_vs_wt$avg_log2FC
+names(ranked) <- rownames(markers_scr_vs_wt)
+ranked <- sort(ranked, decreasing = TRUE)
+gsea_go <- gseGO(geneList = ranked, OrgDb = org.Mm.eg.db, keyType = "SYMBOL", ont = "BP")
+gsea_hallmark <- GSEA(geneList = ranked, TERM2GENE = hallmark)
+write.csv(as.data.frame(gsea_go), "write/tables/GSEA_GO_BP.csv", row.names=FALSE)
+write.csv(as.data.frame(gsea_hallmark), "write/tables/GSEA_Hallmark.csv", row.names=FALSE)
+```
+
+# Save Final Seurat Object and Session Info
+
+```{r save}
+SeuratDisk::SaveH5Seurat(seu, filename="write/tables/final_seurat_object.h5seurat")
+writeLines(capture.output(sessionInfo()), "write/tables/sessionInfo.txt")
+```
+
+---
+
+# Conclusion
+
+All results are saved in the `/write/` folder for easy review and sharing.
+```
